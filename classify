@@ -1,0 +1,100 @@
+// This demonstration uses hand-located points to train a classifier.
+// Each training point has a field called 'landcover' containing
+// class labels at that location. The following block contains
+// construction code for the points.  Hover on the 'urban' variable
+// and click, 'Convert' in the dialog.
+
+Map.setCenter(105.078687, 37.679496, 12);
+/**
+ * Function to mask clouds using the Sentinel-2 QA band
+ * @param {ee.Image} image Sentinel-2 image
+ * @return {ee.Image} cloud masked Sentinel-2 image
+ */
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  return image.updateMask(mask).divide(10000);
+}
+
+var ds = ee.ImageCollection('COPERNICUS/S2_SR')
+                  .filterDate('2020-01-01', '2020-01-30')
+                  // Pre-filter to get less cloudy granules.
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',20))
+                  .map(maskS2clouds)
+                  .mean();
+
+
+ds = ds.clip(ROI)
+print(ds)
+var visualization1 = {
+  min: 0.0,
+  max: 0.3,
+  //bands:['clusters']
+  bands: ['B4', 'B3', 'B2'],
+};
+Map.addLayer(ds,visualization1, 'ds')
+
+// Make a cloud-free composite.
+
+// Merge the three geometry layers into a single FeatureCollection.
+var newfc = Is.merge(No);
+
+// Use these bands for classification.
+var bands = ['B2', 'B3', 'B4', 'B5', 'B6', 'B7'];
+// The name of the property on the points storing the class label.
+var classProperty = 'LC';
+
+// Sample the composite to generate training data.  Note that the
+// class label is stored in the 'landcover' property.
+var training = ds.select(bands).sampleRegions({
+  collection: newfc,
+  properties: [classProperty],
+  scale: 30
+});
+
+// Train a CART classifier.
+var classifier = ee.Classifier.minimumDistance().train({
+  features: training,
+  classProperty: classProperty,
+});
+// Print some info about the classifier (specific to CART).
+//print('CART, explained', classifier.explain());
+
+// Classify the composite.
+var classified = ds.classify(classifier);
+Map.centerObject(newfc);
+Map.addLayer(classified)
+//Map.addLayer(classified, {min: 0, max: 1, palette: ['white', 'green']});
+
+// Optionally, do some accuracy assessment.  Fist, add a column of
+// random uniforms to the training dataset.
+var withRandom = training.randomColumn('random');
+
+// We want to reserve some of the data for testing, to avoid overfitting the model.
+var split = 0.7;  // Roughly 70% training, 30% testing.
+var trainingPartition = withRandom.filter(ee.Filter.lt('random', split));
+var testingPartition = withRandom.filter(ee.Filter.gte('random', split));
+
+//  70% 用于用于训练
+var trainedClassifier = ee.Classifier.minimumDistance().train({
+  features: trainingPartition,
+  classProperty: classProperty,
+  inputProperties: bands
+});
+
+// Classify the test FeatureCollection.
+var test = withRandom.classify(trainedClassifier);
+var con2 = trainedClassifier.confusionMatrix()
+print("con2",con2)
+print(test)
+// Print the confusion matrix.
+var confusionMatrix = test.errorMatrix(classProperty, 'classification');
+print('Confusion Matrix', confusionMatrix);
