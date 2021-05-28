@@ -1,0 +1,285 @@
+/**
+*该代码基于GEE平台
+*导入变量说明
+*sampleBefore 初次分类使用的样本
+*sampleAfter 二次精分类使用的样本
+*possible  光伏电场划定区域
+*ROI       研究区域
+*/
+/**
+ * 使用 the Sentinel-2 QA 波段进行云腌膜处理
+ * @param {ee.Image} Sentinel-2 影像
+ * @return {ee.Image} 云腌膜后的 Sentinel-2 影像
+ */
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  // 第10和11位数据代表云和卷云
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+  .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+//可视化参数
+var visualization1 = {
+  min: 0.0,
+  max: 0.3,
+  bands: ['B4', 'B3', 'B2'],
+};
+//sentinel-2 数据数据数据集
+var ds = ee.ImageCollection('COPERNICUS/S2_SR')
+                  .filterDate('2020-01-01', '2021-04-05')
+                  // 云量筛选
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',15))
+                  .map(maskS2clouds)
+                  .filterBounds(ROI)
+                  .median();
+ds = ds.clip(ROI)
+//计算纹理特征
+var R=ds.expression(
+  '(R+G+B)/3',
+  {
+    R: ds.select('B2'),
+    G: ds.select('B3'), 
+    B: ds.select('B4'),
+  });
+R=R.add(127.5).multiply(127.5).toUint16()
+var glcm=R.glcmTexture({size: 8})
+var shade = glcm.select('B2_shade').rename('shade')
+ds=ds.addBands(shade)
+var contrast = glcm.select('B2_contrast').rename('contrast')
+ds=ds.addBands(contrast)
+var dvar = glcm.select('B2_dvar').rename('dvar')
+ds=ds.addBands(dvar)
+var var1=glcm.select('B2_var').rename('var1')
+ds=ds.addBands(var1)
+var dent=glcm.select('B2_dent').rename('dent')
+ds=ds.addBands(dent)
+var diss=glcm.select('B2_diss').rename('diss')
+ds=ds.addBands(diss)
+var ASM = glcm.select('B2_asm').rename('ASM')
+ds=ds.addBands(ASM)
+var CORR=glcm.select('B2_corr').rename('CORR')
+ds=ds.addBands(CORR)
+//计算指数特征
+var NDVI =  ds.expression('float(b("B8") - b("B4")) / (b("B8") + b("B4"))');
+NDVI = NDVI.rename('NDVI')
+var DBSI=ds.expression(
+    '(swir1-green)/(swir1+green)-ndvi',
+    {
+        swir1: ds.select('B11'),
+        green: ds.select('B3'),
+        ndvi: NDVI
+    });
+DBSI = DBSI.rename('DBSI')
+var NDBI=ds.expression(
+  '(swir1-nir)/(swir1+nir)',
+  {
+    swir1: ds.select('B11'),
+    nir: ds.select('B8'), 
+  });
+NDBI = NDBI.rename('NDBI')
+var NDWI = ds.expression(
+  '(green-nir)/(green+nir)',
+  {
+    nir: ds.select('B8'),
+    green: ds.select('B3'), 
+  });
+NDWI = NDWI.rename('NDWI')
+var RRI = ds.expression(
+  'blue/nir',
+  {
+    blue:ds.select('B2'),
+    nir:ds.select('B8')});
+RRI = RRI.rename('RRI')
+ds=ds.addBands(NDVI)
+ds=ds.addBands(DBSI)
+ds=ds.addBands(NDBI)
+ds=ds.addBands(NDWI)
+ds=ds.addBands(RRI)
+var newfc=sampleBefore
+//特征组合
+var bandsCom=[
+['B2', 'B3', 'B4', 'B5', 'B6', 'B7','B8','B8A','B11','B12',
+'NDVI','DBSI','NDBI','NDWI','RRI'
+,'contrast','dvar','var1','ASM','CORR','dent']
+['B2', 'B3', 'B4', 'B5', 'B6', 'B7','B8','B8A','B11','B12'],
+['NDVI','DBSI','NDBI','NDWI','RRI'],
+['contrast','dvar','var1','ASM','CORR','dent'],
+['B12','B11','NDVI','dvar','NDBI','DBSI','contrast','RRI','ASM','B4','var1','B2','NDWI'],
+['B12','B11','B4','B2','B8A','B7','NDVI','NDBI','DBSI','dvar','contrast','ASM'],
+['RRI','B2','NDBI','B12','B11','B8A','NDVI','DBSI','B4','B5','dent','B6','B8'],
+['B2','B12','B11','B8A','B4','B5','RRI','NDBI','NDVI','dent','var1','contrast']
+]
+var i=3
+var bands = bandsCom[i]
+var numOfTrees1 = 30
+var numOfTrees2 = 15
+// 存储样本点分类标签的属性
+var classProperty = 'LC';
+//初次分类
+// 采集样本点数据
+// 分类标签存储在'LC'字段中 
+var training = ds.select(bands).sampleRegions({
+  collection: newfc,
+  properties: [classProperty],
+  scale: 10,
+  tileScale :2
+});
+ //训练随机森林分类器
+var classifier = ee.Classifier.smileRandomForest(numOfTrees1).train({
+  features: training,
+  classProperty: classProperty,
+});
+// 输出随机森林分类器的信息
+print('FR, explained', classifier.explain());
+ //训练CART决策树分类器
+var classifier_cart = ee.Classifier.smileCart().train({
+  features: training,
+  classProperty: classProperty,
+});
+//输出CART决策树分类器信息
+print('Cart, explained', classifier_cart.explain());
+// 选择最优的特征组合和分类器进行分类分类
+//var classified = ds.classify(classifier);
+//Map.addLayer(classified, {min: 0, max: 5, palette: ['white','red','blue', 'green','yellow','purple']});
+//精度评估，在训练数据中添加一列随机数
+var withRandom = training.randomColumn('random');
+// 保存一些数据进行测试，防止过拟合
+var split = 0.7;  // 大约70%训练，30%测试
+var trainingPartition = withRandom.filter(ee.Filter.lt('random', split));
+var testingPartition = withRandom.filter(ee.Filter.gte('random', split));
+//  70% 用于用于训练
+var trainedClassifier = ee.Classifier.smileRandomForest(numOfTrees1).train({
+  features: trainingPartition,
+  classProperty: classProperty,
+  inputProperties: bands
+});
+var trainedClassifier_cart = ee.Classifier.smileCart().train({
+  features: trainingPartition,
+  classProperty: classProperty,
+  inputProperties: bands
+});
+// 对测试样本进行分类
+var test = testingPartition.classify(trainedClassifier);
+var test_cart = testingPartition.classify(trainedClassifier_cart);
+// 输出混淆矩阵以及计算的相关的精度
+var confusionMatrix = test.errorMatrix(classProperty, 'classification');
+var confusionMatrix_cart = test_cart.errorMatrix(classProperty, 'classification');
+print('RF first Confusion Matrix', confusionMatrix);
+print("OA",confusionMatrix.accuracy())
+print("CA",confusionMatrix.consumersAccuracy())
+print("kappa",confusionMatrix.kappa())
+print("PA",confusionMatrix.producersAccuracy())
+
+print('cart first Confusion Matrix', confusionMatrix_cart);
+print(confusionMatrix_cart.accuracy())
+print("CA",confusionMatrix_cart.consumersAccuracy())
+print("kappa",confusionMatrix_cart.kappa())
+print("PA",confusionMatrix_cart.producersAccuracy())
+// 二次精选
+var newfc2 = sampleAfter
+var ds2 = ds.clip(possiblenew)
+var training2 = ds2.select(bands).sampleRegions({
+  collection: newfc2,
+  properties: [classProperty],
+  scale: 10,
+   tileScale :2
+});
+var classifier2 = ee.Classifier.smileRandomForest(numOfTrees2).train({
+  features: training2,
+  classProperty: classProperty,
+});
+var classifier2_cart = ee.Classifier.smileCart().train({
+  features: training2,
+  classProperty: classProperty,
+});
+print("RF second_explain",classifier2.explain())
+print("Cart second_explain",classifier2_cart.explain())
+/*
+*选择最优的特征组合和分类器进行二次分类
+var classified2 = ds2.classify(classifier2);
+*/
+var withRandom2 = training2.randomColumn('random');
+var trainingPartition2 = withRandom2.filter(ee.Filter.lt('random', split));
+var testingPartition2 = withRandom2.filter(ee.Filter.gte('random', split));
+var trainedClassifier2 = ee.Classifier.smileRandomForest(numOfTrees2).train({
+  features: trainingPartition2,
+  classProperty: classProperty,
+  inputProperties: bands
+});
+var trainedClassifier2_cart = ee.Classifier.smileCart().train({
+  features: trainingPartition2,
+  classProperty: classProperty,
+  inputProperties: bands
+});
+var test2 = testingPartition2.classify(trainedClassifier2);
+var test2_cart = testingPartition2.classify(trainedClassifier2_cart);
+var confusionMatrix2 = test2.errorMatrix(classProperty, 'classification');
+print('RF sencond Confusion Matrix2', confusionMatrix2);
+print("OA",confusionMatrix2.accuracy())
+print("CA",confusionMatrix2.consumersAccuracy())
+print("kappa",confusionMatrix2.kappa())
+print("PA",confusionMatrix2.producersAccuracy())
+var confusionMatrix2_cart = test2_cart.errorMatrix(classProperty, 'classification');
+print('Cart sencond Confusion Matrix2', confusionMatrix2_cart);
+print(confusionMatrix2_cart.accuracy())
+print("CA",confusionMatrix2_cart.consumersAccuracy())
+print("kappa",confusionMatrix2_cart.kappa())
+print("PA",confusionMatrix2_cart.producersAccuracy())
+//var re=classified.toUint8()
+//var re2=classified2.toUint8()
+//Map.addLayer(re)
+//var image = classified.eq(1)
+//可视化
+//Map.addLayer(ds.divide(10000).select(["B2","B3","B4"]),visualization1, 'ds')
+//Map.addLayer(possible1)
+//Map.addLayer(re,{min:0,max:7,palette: ['blue','red','white', 'green','purple','white','white','yellow']},"berfore")
+//Map.addLayer(image, {min: 0, max: 1, palette: ['white','blue']}, '0 or 1');
+//Map.addLayer(classified2.toUint8().eq(1), {min: 0, max: 1, palette: ['white','red']},'after');
+//Map.addLayer(opened, {min: 0, max: 1, palette: ['white','yellow']}, 'opened');
+print("done")
+//将最优的一次实验结果导出
+/*
+Export.image.toDrive({ 
+  image: re, 
+  description: "classifid0406beforeCART", 
+  folder: "tF1", 
+  region:ROI,
+  maxPixels:102618413919,
+}); 
+Export.image.toDrive({ 
+  image: re2, 
+  description: "classifid0406afterCART", 
+  folder: "tF1", 
+  region:ROI,
+  maxPixels:102618413919,
+}); 
+/*
+Export.image.toDrive({ 
+  image: image, 
+  description: "classifid0406before0ro1", 
+  folder: "tF1", 
+  region:ROI,
+  maxPixels:102618413919,
+}); 
+Export.image.toDrive({ 
+  image: re, 
+  description: "classifid0406", 
+  folder: "tF1", 
+  region:ROI,
+  maxPixels:102618413919,
+}); 
+Export.image.toDrive({ 
+  image: re2, 
+  description: "classifid2_0326", 
+  folder: "tF1", 
+  region:possible,
+  maxPixels:102618413919,
+}); 
+Export.image.toDrive({ 
+  image: ds1.select('B2','B3','B4'), 
+  description: "ds1", 
+  folder: "tF1", 
+  region:ROI,
+}); */
