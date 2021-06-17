@@ -35,6 +35,9 @@ var ds = ee.ImageCollection('COPERNICUS/S2_SR')
                   .filterBounds(ROI)
                   .median();
 ds = ds.clip(ROI)
+//SNIC
+// change size or campatness to find better result
+var snic=ee.Algorithms.Image.Segmentation.SNIC(ds.clip(possible), 100, 5)
 //计算纹理特征
 var R=ds.expression(
   '(R+G+B)/3',
@@ -283,3 +286,4 @@ Export.image.toDrive({
   folder: "tF1", 
   region:ROI,
 }); */
+
